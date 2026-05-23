@@ -42,7 +42,7 @@ def create_index_from_path(
     for file_path in walk_files(path, extensions, ignore):
         language = language_for_path(file_path)
         with contextlib.suppress(OSError):
-            source = file_path.read_text(encoding="utf-8", errors="replace")
+            source = file_path.read_text(encoding="utf-8-sig", errors="replace")
             chunk_path = file_path.relative_to(display_root) if display_root else file_path
             file_chunks = chunk_source(source, str(chunk_path), language)
             chunks.extend(file_chunks)

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 def chunk_file(file_path: Path) -> list[Chunk]:
     """Chunk a single file from disk."""
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        source = file_path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return []
 
