@@ -156,19 +156,21 @@ def _extract_graph_data(source: str, language: str):
 
     try:
         parser = tsl.get_parser(ts_lang)
-        tree = parser.parse(source.encode("utf-8"))
+        tree = parser.parse(source)
     except Exception:
         logger.debug("Tree-sitter parse failed for language %r", ts_lang, exc_info=True)
         return None, None, None, None, None
 
+    source_bytes = source.encode("utf-8")
+
     try:
-        symbols = _extract_symbols(tree, source, ts_lang)
+        symbols = _extract_symbols(tree, source_bytes, ts_lang)
     except Exception:
         logger.debug("Symbol extraction failed", exc_info=True)
         symbols = []
 
     try:
-        raw_edges, import_map, wildcard_modules, alias_map = _extract_edges_and_imports(tree, source, ts_lang)
+        raw_edges, import_map, wildcard_modules, alias_map = _extract_edges_and_imports(tree, source_bytes, ts_lang)
     except Exception:
         logger.debug("Edge extraction failed", exc_info=True)
         raw_edges, import_map, wildcard_modules, alias_map = [], {}, [], {}
@@ -218,25 +220,25 @@ def _chunk_for_line(line: int, line_map: list[tuple[int, int, str]]) -> str | No
     return None
 
 
-def _extract_symbols(tree, source: str, lang: str) -> list[dict]:
+def _extract_symbols(tree, source: bytes, lang: str) -> list[dict]:
     symbols: list[dict] = []
-    _walk_symbols(tree.root_node, source, lang, symbols)
+    _walk_symbols(_root_node(tree), source, lang, symbols)
     return symbols
 
 
-def _walk_symbols(node, source: str, lang: str, symbols: list[dict]) -> None:
-    kind = node.type
+def _walk_symbols(node, source: bytes, lang: str, symbols: list[dict]) -> None:
+    kind = _node_type(node)
 
     if kind in _FUNC_NODE_TYPES:
-        name = _child_text(node, _FUNC_NAME_FIELDS)
+        name = _child_text(node, _FUNC_NAME_FIELDS, source)
         if name:
-            symbols.append({"name": name, "type": "function", "line": node.start_point[0] + 1})
+            symbols.append({"name": name, "type": "function", "line": _node_start_line(node)})
     elif kind in _CLASS_NODE_TYPES:
-        name = _child_text(node, _CLASS_NAME_FIELDS)
+        name = _child_text(node, _CLASS_NAME_FIELDS, source)
         if name:
-            symbols.append({"name": name, "type": "class", "line": node.start_point[0] + 1})
+            symbols.append({"name": name, "type": "class", "line": _node_start_line(node)})
 
-    for child in node.children:
+    for child in _node_children(node):
         _walk_symbols(child, source, lang, symbols)
 
 
@@ -270,6 +272,7 @@ _CALL_NODE_TYPES: frozenset[str] = frozenset({
     "call_expression",
     "method_invocation",
     "function_call",
+    "invocation_expression",
 })
 
 _IMPORT_NODE_TYPES: frozenset[str] = frozenset({
@@ -291,27 +294,27 @@ _DEF_NODE_TYPES: frozenset[str] = _FUNC_NODE_TYPES | _CLASS_NODE_TYPES
 _DEF_NAME_FIELDS: tuple[str, ...] = _FUNC_NAME_FIELDS + _CLASS_NAME_FIELDS
 
 
-def _extract_edges_and_imports(tree, source: str, lang: str) -> tuple[list[dict], dict[str, str], list[str], dict[str, str]]:
+def _extract_edges_and_imports(tree, source: bytes, lang: str) -> tuple[list[dict], dict[str, str], list[str], dict[str, str]]:
     edges: list[dict] = []
     import_map: dict[str, str] = {}
     wildcard_modules: list[str] = []
     alias_map: dict[str, str] = {}
-    _walk_edges(tree.root_node, source, edges, import_map, wildcard_modules, alias_map)
+    _walk_edges(_root_node(tree), source, edges, import_map, wildcard_modules, alias_map)
     return edges, import_map, wildcard_modules, alias_map
 
 
-def _walk_edges(node, source: str, edges: list[dict], import_map: dict[str, str], wildcard_modules: list[str], alias_map: dict[str, str]) -> None:
-    kind = node.type
+def _walk_edges(node, source: bytes, edges: list[dict], import_map: dict[str, str], wildcard_modules: list[str], alias_map: dict[str, str]) -> None:
+    kind = _node_type(node)
 
     if kind in _CALL_NODE_TYPES:
-        callee = _child_text(node, _CALL_NAME_FIELDS)
+        callee = _child_text(node, _CALL_NAME_FIELDS, source)
         if callee and _is_meaningful_symbol(callee):
-            caller = _enclosing_function(node)
+            caller = _enclosing_function(node, source)
             if callee != caller:
                 edges.append({"source": caller, "target": callee, "type": "calls"})
 
     elif kind in _IMPORT_NODE_TYPES:
-        module_path, names, is_wildcard, aliases = _extract_import_info(node)
+        module_path, names, is_wildcard, aliases = _extract_import_info(node, source)
         if is_wildcard and module_path:
             wildcard_modules.append(module_path)
         for n in names:
@@ -323,15 +326,15 @@ def _walk_edges(node, source: str, edges: list[dict], import_map: dict[str, str]
         alias_map.update(aliases)
 
     elif kind in _CLASS_NODE_TYPES:
-        _extract_inheritance(node, edges)
+        _extract_inheritance(node, edges, source)
 
-    for child in node.children:
+    for child in _node_children(node):
         _walk_edges(child, source, edges, import_map, wildcard_modules, alias_map)
 
 
-def _extract_inheritance(node, edges: list[dict]) -> None:
+def _extract_inheritance(node, edges: list[dict], source: bytes) -> None:
     """Extract ``inherits`` edges from a class definition node."""
-    class_name = _child_text(node, _CLASS_NAME_FIELDS)
+    class_name = _child_text(node, _CLASS_NAME_FIELDS, source)
     if not class_name:
         return
 
@@ -339,17 +342,17 @@ def _extract_inheritance(node, edges: list[dict]) -> None:
     # Python: class Child(Parent) → field "superclasses"
     superclasses = node.child_by_field_name("superclasses")
     if superclasses:
-        for child in superclasses.children:
-            if child.type in ("identifier", "attribute"):
-                text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+        for child in _node_children(superclasses):
+            if _node_type(child) in ("identifier", "attribute"):
+                text = _node_text(child, source)
                 if text:
                     parents.append(text)
     # JS/TS/C#/C++: extends_clause, class_heritage, base_class_clause
-    for child_node in node.children:
-        if child_node.type in ("extends_clause", "class_heritage", "base_class_clause"):
-            for child in child_node.children:
-                if child.type in ("identifier", "type_identifier", "scoped_type_identifier"):
-                    text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+    for child_node in _node_children(node):
+        if _node_type(child_node) in ("extends_clause", "class_heritage", "base_class_clause", "base_list"):
+            for child in _node_children(child_node):
+                if _node_type(child) in ("identifier", "type_identifier", "scoped_type_identifier", "qualified_name", "generic_name"):
+                    text = _node_text(child, source)
                     if text:
                         parents.append(text)
 
@@ -358,7 +361,7 @@ def _extract_inheritance(node, edges: list[dict]) -> None:
             edges.append({"source": class_name, "target": parent_name, "type": "inherits"})
 
 
-def _extract_import_info(node) -> tuple[str | None, list[str], bool, dict[str, str]]:
+def _extract_import_info(node, source: bytes) -> tuple[str | None, list[str], bool, dict[str, str]]:
     """Extract module source and imported names from an import statement.
 
     Returns ``(module_path, [names], is_wildcard, aliases)`` where *aliases*
@@ -370,36 +373,40 @@ def _extract_import_info(node) -> tuple[str | None, list[str], bool, dict[str, s
     is_wildcard = False
     aliases: dict[str, str] = {}
 
-    for child in node.children:
-        if child.type == "dotted_name":
-            text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+    if _node_type(node) == "using_directive":
+        return _extract_csharp_using_info(node, source)
+
+    for child in _node_children(node):
+        child_kind = _node_type(child)
+        if child_kind == "dotted_name":
+            text = _node_text(child, source)
             if text:
                 dotted_names.append(text)
-        elif child.type == "aliased_import":
+        elif child_kind == "aliased_import":
             alias = child.child_by_field_name("alias")
             original = child.child_by_field_name("name")
             alias_text: str | None = None
             original_text: str | None = None
             if alias:
-                alias_text = alias.text.decode("utf-8") if isinstance(alias.text, bytes) else alias.text
+                alias_text = _node_text(alias, source)
                 if alias_text:
                     names.append(alias_text)
             if original:
-                original_text = original.text.decode("utf-8") if isinstance(original.text, bytes) else original.text
+                original_text = _node_text(original, source)
                 if original_text:
                     names.append(original_text)
             if alias_text and original_text:
                 aliases[alias_text] = original_text
             elif not alias and not original:
-                first = next((c for c in child.children if c.type == "dotted_name"), None)
+                first = next((c for c in _node_children(child) if _node_type(c) == "dotted_name"), None)
                 if first:
-                    text = first.text.decode("utf-8") if isinstance(first.text, bytes) else first.text
+                    text = _node_text(first, source)
                     if text:
                         names.append(text)
-        elif child.type == "wildcard_import":
+        elif child_kind == "wildcard_import":
             is_wildcard = True
 
-    if node.type == "import_from_statement":
+    if _node_type(node) == "import_from_statement":
         if dotted_names:
             module_path = dotted_names[0]
             names.extend(dotted_names[1:] if len(dotted_names) > 1 else [])
@@ -432,28 +439,115 @@ def _is_meaningful_symbol(name: str) -> bool:
     return len(base) >= 2
 
 
-def _child_text(node, field_names: tuple[str, ...]) -> str | None:
+def _child_text(node, field_names: tuple[str, ...], source: bytes) -> str | None:
     for name in field_names:
         child = node.child_by_field_name(name)
         if child is not None:
-            text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+            text = _node_text(child, source)
             if text:
                 return text
-    for child in node.children:
-        if child.type in ("identifier", "attribute") or child.type.endswith("_identifier"):
-            text = child.text.decode("utf-8") if isinstance(child.text, bytes) else child.text
+    for child in _node_children(node):
+        child_kind = _node_type(child)
+        if child_kind in ("identifier", "attribute", "qualified_name", "generic_name") or child_kind.endswith("_identifier"):
+            text = _node_text(child, source)
             if text:
                 return text
     return None
 
 
-def _enclosing_function(node) -> str:
+def _enclosing_function(node, source: bytes) -> str:
     """Return the enclosing function/class name, or ``*module*`` for top-level calls."""
-    current = node.parent
+    current = _node_parent(node)
     while current is not None:
-        if current.type in _DEF_NODE_TYPES:
-            name = _child_text(current, _DEF_NAME_FIELDS)
+        if _node_type(current) in _DEF_NODE_TYPES:
+            name = _child_text(current, _DEF_NAME_FIELDS, source)
             if name:
                 return name
-        current = current.parent
+        current = _node_parent(current)
     return "*module*"
+
+
+def _root_node(tree):
+    root_node = getattr(tree, "root_node", None)
+    return root_node() if callable(root_node) else root_node
+
+
+def _node_type(node) -> str:
+    kind = getattr(node, "kind", None)
+    if callable(kind):
+        return kind()
+    node_type = getattr(node, "type", None)
+    return node_type() if callable(node_type) else node_type
+
+
+def _node_children(node):
+    children = getattr(node, "children", None)
+    if children is not None:
+        return children() if callable(children) else children
+    child_count = getattr(node, "child_count", None)
+    child = getattr(node, "child", None)
+    if callable(child_count) and callable(child):
+        return [child(index) for index in range(child_count())]
+    return []
+
+
+def _node_text(node, source: bytes) -> str | None:
+    text = getattr(node, "text", None)
+    text = text() if callable(text) else text
+    if text is None:
+        start = getattr(node, "start_byte", None)
+        end = getattr(node, "end_byte", None)
+        start = start() if callable(start) else start
+        end = end() if callable(end) else end
+        if start is None or end is None:
+            return None
+        text = source[int(start):int(end)]
+    if isinstance(text, bytes):
+        return text.decode("utf-8", errors="ignore")
+    return text
+
+
+def _node_parent(node):
+    parent = getattr(node, "parent", None)
+    return parent() if callable(parent) else parent
+
+
+def _node_start_line(node) -> int:
+    position = getattr(node, "start_position", None)
+    position = position() if callable(position) else position
+    if position is None:
+        position = getattr(node, "start_point", None)
+        position = position() if callable(position) else position
+    if isinstance(position, tuple):
+        return int(position[0]) + 1
+    if hasattr(position, "row"):
+        return int(position.row) + 1
+    if hasattr(position, "__getitem__"):
+        return int(position[0]) + 1
+    return 1
+
+
+def _extract_csharp_using_info(node, source: bytes) -> tuple[str | None, list[str], bool, dict[str, str]]:
+    aliases: dict[str, str] = {}
+    names: list[str] = []
+    module_path = None
+    alias = node.child_by_field_name("name")
+    value = node.child_by_field_name("value")
+    if alias is not None and value is not None:
+        alias_text = _node_text(alias, source)
+        value_text = _node_text(value, source)
+        if alias_text and value_text:
+            names.append(alias_text)
+            aliases[alias_text] = value_text
+            module_path = value_text
+            return module_path, names, False, aliases
+
+    for child in _node_children(node):
+        child_kind = _node_type(child)
+        if child_kind in ("identifier", "qualified_name", "alias_qualified_name"):
+            text = _node_text(child, source)
+            if text:
+                module_path = text
+                names.append(text.split(".")[-1])
+                break
+    return module_path, names, False, aliases
